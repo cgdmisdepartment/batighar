@@ -199,7 +199,11 @@
         </button>
       </div>
     </div>
-    <div id="iframeContainer" class="flex-grow relative bg-white"></div>
+    <div id="iframeContainer" class="flex-grow relative bg-white">
+      <div id="appLoadingSpinner" class="hidden absolute inset-0 flex items-center justify-center bg-slate-900 z-10">
+        <i class="fa-solid fa-circle-notch fa-spin text-3xl text-blue-400"></i>
+      </div>
+    </div>
   </div>
 
   <!-- ================= JAVASCRIPT LOGIC ================= -->
@@ -216,15 +220,31 @@
   const loadedIframes = {};
 
   // ================= FETCH HELPERS (google.script.run-এর বদলে) =================
+  // Cache-first strategy: আগে লোকালে সেভ করা অ্যাপ লিস্ট থাকলে সাথে সাথে দেখানো হয়,
+  // তারপর ব্যাকগ্রাউন্ডে আসল ডেটা এনে আপডেট করা হয় — ফলে দ্বিতীয়বার থেকে অ্যাপ প্রায় তাৎক্ষণিক খোলে।
   async function fetchAppList() {
+    const cacheKey = 'cachedAppList';
+    const cached = localStorage.getItem(cacheKey);
+
+    if (cached) {
+      try {
+        rawApps = JSON.parse(cached);
+        renderCards();
+      } catch (e) { /* ignore parse error */ }
+    }
+
     try {
       const res = await fetch(`${API_BASE}?action=data`);
       const data = await res.json();
       rawApps = data.appList || [];
+      localStorage.setItem(cacheKey, JSON.stringify(rawApps));
+      renderCards();
     } catch (err) {
       console.error("App list fetch error:", err);
-      document.getElementById('loadingState').innerHTML =
-        `<p class="text-red-400">অ্যাপ লিস্ট লোড করা যায়নি। API_BASE URL ঠিক আছে কিনা দেখুন।</p>`;
+      if (!cached) {
+        document.getElementById('loadingState').innerHTML =
+          `<p class="text-red-400">অ্যাপ লিস্ট লোড করা যায়নি। API_BASE URL ঠিক আছে কিনা দেখুন।</p>`;
+      }
     }
   }
 
@@ -238,55 +258,43 @@
     }
   }
 
-  // ================= 1. SMART PRELOAD ENGINE =================
-  function preloadIframes() {
+  // ================= 1. LAZY LOAD ENGINE =================
+  // আগে সব অ্যাপ/সাব-অ্যাপ পেজলোডের সাথেই প্রি-লোড হতো, যেটা স্লো করে দিচ্ছিল।
+  // এখন কোনো অ্যাপ তখনই লোড হবে যখন ব্যবহারকারী সেটাতে ক্লিক করবে (একবার লোড হলে
+  // পরের বার আর নতুন করে লোড হবে না, loadedIframes-এ থেকে যাবে)।
+  async function ensureIframeLoaded(app) {
+    const safeId = 'iframe_' + app.title.replace(/[^a-zA-Z0-9]/g, '_');
+    const existing = document.getElementById(safeId);
+    if (existing) return existing;
+
     const iframeContainer = document.getElementById('iframeContainer');
-    if (!iframeContainer) return;
+    const containerDiv = document.createElement('div');
+    containerDiv.id = safeId;
+    containerDiv.setAttribute('data-title', app.title);
+    containerDiv.className = 'app-iframe hidden w-full h-full overflow-auto bg-slate-900';
 
-    const allAppsToLoad = [];
-    rawApps.forEach(app => {
-      allAppsToLoad.push({ title: app.title, url: app.url });
-      if (app.subApps && app.subApps.length > 0) {
-        app.subApps.forEach(sub => {
-          allAppsToLoad.push({ title: sub.title, url: sub.url });
-        });
-      }
-    });
+    const savedStateUrl = localStorage.getItem('appState_' + encodeURIComponent(app.title));
+    const targetUrl = savedStateUrl || app.url;
 
-    allAppsToLoad.forEach(async (app) => {
-      const safeId = 'iframe_' + app.title.replace(/[^a-zA-Z0-9]/g, '_');
-      if (document.getElementById(safeId)) return;
+    if (targetUrl && !targetUrl.startsWith('http')) {
+      // প্রজেক্টের ভেতরের HTML ফাইল — iframe + srcdoc দিয়ে লোড করা হচ্ছে
+      const htmlContent = await fetchHtmlFile(targetUrl);
+      const innerIframe = document.createElement('iframe');
+      innerIframe.className = 'w-full h-full border-none';
+      innerIframe.setAttribute('allow', 'geolocation');
+      innerIframe.srcdoc = htmlContent;
+      containerDiv.appendChild(innerIframe);
+    } else if (targetUrl) {
+      const iframe = document.createElement('iframe');
+      iframe.src = targetUrl;
+      iframe.className = 'w-full h-full border-none';
+      iframe.setAttribute('allow', 'geolocation');
+      containerDiv.appendChild(iframe);
+    }
 
-      const containerDiv = document.createElement('div');
-      containerDiv.id = safeId;
-      containerDiv.setAttribute('data-title', app.title);
-      containerDiv.className = 'app-iframe hidden w-full h-full overflow-auto bg-slate-900';
-
-      const savedStateUrl = localStorage.getItem('appState_' + encodeURIComponent(app.title));
-      const targetUrl = savedStateUrl || app.url;
-
-      if (targetUrl && !targetUrl.startsWith('http')) {
-        // প্রজেক্টের ভেতরের HTML ফাইল — iframe + srcdoc দিয়ে লোড করা হচ্ছে
-        // (innerHTML-এর বদলে srcdoc ব্যবহার করা হচ্ছে, কারণ innerHTML দিয়ে
-        //  বসানো <script> ট্যাগ ব্রাউজারে রান হয় না, কিন্তু srcdoc-এ হয়)
-        const htmlContent = await fetchHtmlFile(targetUrl);
-        const innerIframe = document.createElement('iframe');
-        innerIframe.className = 'w-full h-full border-none';
-        innerIframe.setAttribute('allow', 'geolocation');
-        innerIframe.srcdoc = htmlContent;
-        containerDiv.appendChild(innerIframe);
-      } else if (targetUrl) {
-        // External Web App URL (নিজস্ব Apps Script deployment বা অন্য কোনো সাইট)
-        const iframe = document.createElement('iframe');
-        iframe.src = targetUrl;
-        iframe.className = 'w-full h-full border-none';
-        iframe.setAttribute('allow', 'geolocation');
-        containerDiv.appendChild(iframe);
-      }
-
-      iframeContainer.appendChild(containerDiv);
-      loadedIframes[app.title] = containerDiv;
-    });
+    iframeContainer.appendChild(containerDiv);
+    loadedIframes[app.title] = containerDiv;
+    return containerDiv;
   }
 
   // ================= 2. DASHBOARD CARDS RENDER ENGINE =================
@@ -405,7 +413,7 @@
   }
 
   // ================= 4. INSTANT LAUNCH & MEMORY OPTIMIZATION =================
-  function openApp(name) {
+  async function openApp(name) {
     localStorage.setItem('lastOpenedApp', name);
 
     let appObj = rawApps.find(a => a.title === name);
@@ -419,6 +427,18 @@
     }
     activeAppObj = appObj;
 
+    document.getElementById('modalTitle').innerText = name;
+    document.getElementById('appModal').style.display = 'flex';
+
+    // প্রথমবার খোলা হলে (এখনো লোড হয়নি) স্পিনার দেখানো
+    const alreadyLoaded = !!loadedIframes[name];
+    const spinner = document.getElementById('appLoadingSpinner');
+    if (!alreadyLoaded && spinner) spinner.classList.remove('hidden');
+
+    await ensureIframeLoaded(appObj);
+
+    if (spinner) spinner.classList.add('hidden');
+
     const safeId = 'iframe_' + name.replace(/[^a-zA-Z0-9]/g, '_');
     document.querySelectorAll('.app-iframe').forEach(container => {
       if (container.id === safeId) {
@@ -429,9 +449,6 @@
         container.classList.add('hidden');
       }
     });
-
-    document.getElementById('modalTitle').innerText = name;
-    document.getElementById('appModal').style.display = 'flex';
 
     setTimeout(() => {
       freeMemoryExceptActive(name);
@@ -481,10 +498,9 @@
 
     activeAppObj = null;
     renderCards();
-
-    setTimeout(() => {
-      preloadIframes();
-    }, 300);
+    // এখন আর সব অ্যাপ আবার প্রি-লোড হয় না — একবার খোলা অ্যাপ loadedIframes-এ
+    // থেকে যায়, পরের বার সাথে সাথে খুলবে, কিন্তু বন্ধ থাকা অবস্থায় ব্যাকগ্রাউন্ডে
+    // নতুন করে লোড হবে না।
   }
 
   // ================= 6. SYNC BUTTON (FORCE REFRESH) =================
@@ -675,10 +691,8 @@
 
   // ================= 10. LIFECYCLE INIT =================
   window.addEventListener('load', async function () {
-    await fetchAppList();
-    renderCards();
+    await fetchAppList(); // এটা নিজে থেকেই renderCards() কল করে (cache + fresh, দুইবার)
 
-    setTimeout(() => { preloadIframes(); }, 200);
     setTimeout(checkAndOpenParamApp, 400);
 
     checkAdminNotice();
